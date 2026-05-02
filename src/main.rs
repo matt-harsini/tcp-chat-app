@@ -1,7 +1,7 @@
 use std::env::args;
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::broadcast::{self, error::RecvError},
 };
@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} started...", mode);
         match mode.as_str() {
             "server" => {
-                let (sender, _) = broadcast::channel(128);
+                let (sender, _) = broadcast::channel::<String>(128);
                 let listener = TcpListener::bind("127.0.0.1:8080").await?;
                 println!("Server running on 127.0.0.1:8080");
                 loop {
@@ -24,13 +24,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "client" => {
-                let mut stream = TcpStream::connect("127.0.0.1:8080").await?;
+                let stream = TcpStream::connect("127.0.0.1:8080").await?;
+                let mut line = String::new();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
                 let message = &args[2];
-                stream.write_all(String::as_bytes(message)).await?;
-                let mut buf = [0; 1024];
+                writer
+                    .write_all(format!("{}\n", message).as_bytes())
+                    .await?;
                 loop {
-                    stream.read(&mut buf).await?;
-                    println!("{:?}", String::from_utf8(buf.to_vec()));
+                    reader.read_line(&mut line).await?;
+                    println!("{:?}", line.trim());
+                    line.clear();
                 }
             }
             _ => (),
@@ -39,22 +44,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<Vec<u8>>) {
+async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<String>) {
     let mut receiver = sender.subscribe();
-    let mut buf = [0; 1024];
-    let (mut reader, mut writer) = socket.into_split();
+    let (reader, mut writer) = socket.into_split();
+    let mut line = String::new();
+    let mut reader = BufReader::new(reader);
     loop {
         tokio::select! {
-            n = reader.read(&mut buf) => {
+            n = reader.read_line(&mut line) => {
                 match n {
                     Ok(0) => {
                         return;
                     }
-                    Ok(n) => {
-                        let _ = match sender.send(buf[..n].to_vec()) {
-                            Ok(n) => n,
-                            Err(_) => 0,
-                        };
+                    Ok(_) => {
+                        let _ = sender.send(line.clone());
+                        line.clear();
                     }
                     Err(e) => {
                         println!("Err {:?}", e);
@@ -65,7 +69,7 @@ async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<Vec<u8>>
             msg = receiver.recv() => {
                 match msg {
                     Ok(msg) => {
-                        if let Err(_) = writer.write_all(&msg).await {
+                        if let Err(_) = writer.write_all(msg.as_bytes()).await {
                             return;
                         }
                     }
