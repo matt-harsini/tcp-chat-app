@@ -25,17 +25,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "client" => {
                 let stream = TcpStream::connect("127.0.0.1:8080").await?;
-                let mut line = String::new();
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = BufReader::new(reader);
-                let message = &args[2];
-                writer
-                    .write_all(format!("{}\n", message).as_bytes())
-                    .await?;
+                let stdin = tokio::io::stdin();
+                let mut stdin_reader = BufReader::new(stdin);
+                let mut stdin_line = String::new();
+                let mut net_line = String::new();
                 loop {
-                    reader.read_line(&mut line).await?;
-                    println!("{:?}", line.trim());
-                    line.clear();
+                    tokio::select! {
+                        _ = stdin_reader.read_line(&mut stdin_line) => {
+                            if let Err(_) = writer.write_all(stdin_line.as_bytes()).await {
+                                return Ok(());
+                            }
+                            stdin_line.clear();
+                        }
+                        n = reader.read_line(&mut net_line) => {
+                            match n {
+                                Ok(0) => return Ok(()),
+                                Ok(_) => {
+                                    print!("{}", net_line);
+                                    net_line.clear();
+                                },
+                                Err(_) => return Ok(())
+                            }
+                        }
+                    }
                 }
             }
             _ => (),
@@ -49,6 +63,14 @@ async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<String>)
     let (reader, mut writer) = socket.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(reader);
+    if let Err(_) = writer.write_all(b"Username: ").await {
+        return;
+    }
+    if let Err(_) = reader.read_line(&mut line).await {
+        return;
+    }
+    let username = line.trim().to_string();
+    line.clear();
     loop {
         tokio::select! {
             n = reader.read_line(&mut line) => {
@@ -57,7 +79,10 @@ async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<String>)
                         return;
                     }
                     Ok(_) => {
-                        let _ = sender.send(line.clone());
+                        if line.trim() == "/quit" {
+                            return;
+                        }
+                        let _ = sender.send(format!("{}: {}", username, line));
                         line.clear();
                     }
                     Err(e) => {
