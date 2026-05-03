@@ -1,10 +1,32 @@
-use std::env::args;
+use std::{collections::HashMap, env::args};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::broadcast::{self, error::RecvError},
+    sync::{
+        broadcast::{self, error::RecvError},
+        mpsc,
+    },
 };
+
+enum RouterCommand {
+    Join {
+        name: String,
+        mailbox: mpsc::Sender<String>,
+    },
+    Leave {
+        name: String,
+    },
+    Broadcast {
+        from: String,
+        line: String,
+    },
+    Direct {
+        from: String,
+        to: String,
+        line: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -105,6 +127,37 @@ async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<String>)
                             },
                             RecvError::Closed => return,
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn router(mut rx: mpsc::Receiver<RouterCommand>) {
+    let mut map: HashMap<String, mpsc::Sender<String>> = HashMap::new();
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            RouterCommand::Join { name, mailbox } => {
+                map.insert(name, mailbox);
+            }
+            RouterCommand::Leave { name } => {
+                map.remove(&name);
+            }
+            RouterCommand::Broadcast { from, line } => {
+                for (name, v) in &map {
+                    if name == &from {
+                        continue;
+                    }
+                    if let Err(e) = v.try_send(format!("{}: {}", from, line)) {
+                        println!("{:?}", e);
+                    }
+                }
+            }
+            RouterCommand::Direct { from, to, line } => {
+                if let Some(sender) = map.get(&to) {
+                    if let Err(e) = sender.send(format!("{}: {}", from, line)).await {
+                        println!("{:?}", e);
                     }
                 }
             }
