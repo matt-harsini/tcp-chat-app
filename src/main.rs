@@ -3,10 +3,7 @@ use std::{collections::HashMap, env::args};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{
-        broadcast::{self, error::RecvError},
-        mpsc,
-    },
+    sync::mpsc,
 };
 
 enum RouterCommand {
@@ -36,13 +33,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} started...", mode);
         match mode.as_str() {
             "server" => {
-                let (sender, _) = broadcast::channel::<String>(128);
                 let listener = TcpListener::bind("127.0.0.1:8080").await?;
                 println!("Server running on 127.0.0.1:8080");
+                let (cmd_tx, cmd_rx) = mpsc::channel::<RouterCommand>(128);
+                tokio::spawn(router(cmd_rx));
                 loop {
                     let (socket, addr) = listener.accept().await?;
                     println!("New connection from: {}", addr);
-                    tokio::spawn(handle_connection(socket, sender.clone()));
+                    tokio::spawn(handle_connection(socket, cmd_tx.clone()));
                 }
             }
             "client" => {
@@ -80,8 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<String>) {
-    let mut receiver = sender.subscribe();
+async fn handle_connection(socket: TcpStream, sender: mpsc::Sender<RouterCommand>) {
     let (reader, mut writer) = socket.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(reader);
@@ -93,40 +90,82 @@ async fn handle_connection(socket: TcpStream, sender: broadcast::Sender<String>)
     }
     let username = line.trim().to_string();
     line.clear();
+    let (tx, mut rx) = mpsc::channel::<String>(64);
+    if let Err(e) = sender
+        .send(RouterCommand::Join {
+            name: username.clone(),
+            mailbox: tx,
+        })
+        .await
+    {
+        println!("{:?}", e);
+        return;
+    }
     loop {
         tokio::select! {
             n = reader.read_line(&mut line) => {
                 match n {
                     Ok(0) => {
+                        if let Err(e) = sender.send(RouterCommand::Leave {name: username.clone()}).await {
+                            println!("{}", e);
+                            return;
+                        }
                         return;
                     }
                     Ok(_) => {
-                        if line.trim() == "/quit" {
+                        let trimmed = line.trim();
+                        if trimmed == "/quit" {
+                            if let Err(e) = sender.send(RouterCommand::Leave { name: username.clone() }).await {
+                                println!("{}", e);
+                            }
+                            line.clear();
                             return;
+                        } else if let Some(rest) = trimmed.strip_prefix("/dm ") {
+                            let mut parts = rest.splitn(2, ' ');
+                            if let Some((to, msg)) = parts.next().zip(parts.next()) {
+                                println!("{}, {}", to, msg);
+                                if let Err(e) = sender.send(RouterCommand::Direct {
+                                    from: username.clone(),
+                                    to: to.to_string(),
+                                    line: msg.to_string(),
+                                }).await {
+                                    println!("{}", e);
+                                }
+                            }
+                        } else {
+                            if let Err(e) = sender.send(RouterCommand::Broadcast {
+                                from: username.clone(),
+                                line: line.clone(),
+                            }).await {
+                                println!("{}", e);
+                                return;
+                            }
                         }
-                        let _ = sender.send(format!("{}: {}", username, line));
                         line.clear();
                     }
                     Err(e) => {
                         println!("Err {:?}", e);
+                        if let Err(e) = sender.send(RouterCommand::Leave {name: username.clone()}).await {
+                            println!("{}", e);
+                            return;
+                        }
                         return;
                     }
                 }
             }
-            msg = receiver.recv() => {
+            msg = rx.recv() => {
                 match msg {
-                    Ok(msg) => {
+                   Some(msg) => {
                         if let Err(_) = writer.write_all(msg.as_bytes()).await {
                             return;
                         }
                     }
-                    Err(n) => {
-                        match n {
-                            RecvError::Lagged(n) => {
-                                println!("Lagged by {} messages", n);
-                            },
-                            RecvError::Closed => return,
+                    None => {
+                        if let Err(e) = sender.send(RouterCommand::Leave {name: username.clone()}).await {
+                            println!("{}", e);
+                            return;
                         }
+                        return;
                     }
                 }
             }
@@ -149,16 +188,15 @@ async fn router(mut rx: mpsc::Receiver<RouterCommand>) {
                     if name == &from {
                         continue;
                     }
-                    if let Err(e) = v.try_send(format!("{}: {}", from, line)) {
+                    if let Err(e) = v.try_send(format!("{}: {}\n", from, line)) {
                         println!("{:?}", e);
                     }
                 }
             }
             RouterCommand::Direct { from, to, line } => {
+                println!("{}, {}, {}", from, to, line);
                 if let Some(sender) = map.get(&to) {
-                    if let Err(e) = sender.send(format!("{}: {}", from, line)).await {
-                        println!("{:?}", e);
-                    }
+                    let _ = sender.try_send(format!("{}: {}\n", from, line));
                 }
             }
         }
