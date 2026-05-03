@@ -25,6 +25,19 @@ enum RouterCommand {
     },
 }
 
+struct LeaveGuard {
+    name: String,
+    sender: mpsc::Sender<RouterCommand>,
+}
+
+impl Drop for LeaveGuard {
+    fn drop(&mut self) {
+        let _ = self.sender.try_send(RouterCommand::Leave {
+            name: self.name.clone(),
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = args().collect();
@@ -101,29 +114,25 @@ async fn handle_connection(socket: TcpStream, sender: mpsc::Sender<RouterCommand
         println!("{:?}", e);
         return;
     }
+    let _guard = LeaveGuard {
+        name: username.clone(),
+        sender: sender.clone(),
+    };
     loop {
         tokio::select! {
             n = reader.read_line(&mut line) => {
                 match n {
                     Ok(0) => {
-                        if let Err(e) = sender.send(RouterCommand::Leave {name: username.clone()}).await {
-                            println!("{}", e);
-                            return;
-                        }
                         return;
                     }
                     Ok(_) => {
                         let trimmed = line.trim();
                         if trimmed == "/quit" {
-                            if let Err(e) = sender.send(RouterCommand::Leave { name: username.clone() }).await {
-                                println!("{}", e);
-                            }
                             line.clear();
                             return;
                         } else if let Some(rest) = trimmed.strip_prefix("/dm ") {
                             let mut parts = rest.splitn(2, ' ');
                             if let Some((to, msg)) = parts.next().zip(parts.next()) {
-                                println!("{}, {}", to, msg);
                                 if let Err(e) = sender.send(RouterCommand::Direct {
                                     from: username.clone(),
                                     to: to.to_string(),
@@ -145,10 +154,6 @@ async fn handle_connection(socket: TcpStream, sender: mpsc::Sender<RouterCommand
                     }
                     Err(e) => {
                         println!("Err {:?}", e);
-                        if let Err(e) = sender.send(RouterCommand::Leave {name: username.clone()}).await {
-                            println!("{}", e);
-                            return;
-                        }
                         return;
                     }
                 }
@@ -161,10 +166,6 @@ async fn handle_connection(socket: TcpStream, sender: mpsc::Sender<RouterCommand
                         }
                     }
                     None => {
-                        if let Err(e) = sender.send(RouterCommand::Leave {name: username.clone()}).await {
-                            println!("{}", e);
-                            return;
-                        }
                         return;
                     }
                 }
@@ -196,7 +197,9 @@ async fn router(mut rx: mpsc::Receiver<RouterCommand>) {
             RouterCommand::Direct { from, to, line } => {
                 println!("{}, {}, {}", from, to, line);
                 if let Some(sender) = map.get(&to) {
-                    let _ = sender.try_send(format!("{}: {}\n", from, line));
+                    if let Err(e) = sender.try_send(format!("{}: {}\n", from, line)) {
+                        println!("{}", e);
+                    }
                 }
             }
         }
