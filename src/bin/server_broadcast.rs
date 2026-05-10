@@ -13,7 +13,9 @@ use tokio::{
 async fn main() -> std::io::Result<()> {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".into());
     let listener = TcpListener::bind(&addr).await?;
-    let (tx, _) = broadcast::channel::<String>(4096);
+    // Large buffer (1M) so transient receiver lag doesn't trigger RecvError::Lagged
+    // — that would silently drop messages and confound the architectural comparison.
+    let (tx, _) = broadcast::channel::<String>(1_000_000);
     eprintln!("[server_broadcast] listening on {}", addr);
 
     loop {

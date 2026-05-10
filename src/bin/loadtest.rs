@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     sync::Mutex,
     time::{interval, sleep},
 };
@@ -36,6 +36,7 @@ struct Args {
     duration_secs: u64,
     warmup_secs: u64,
     rate_per_client_milli: u64, // 0 = saturate; otherwise rate in milli-msgs/sec (1000 = 1/sec, 100 = 0.1/sec)
+    slow_count: usize, // first K clients connect but never read — exposes head-of-line blocking
     label: String,
 }
 
@@ -46,6 +47,7 @@ fn parse_args() -> Args {
         duration_secs: 15,
         warmup_secs: 3,
         rate_per_client_milli: 0,
+        slow_count: 0,
         label: "run".into(),
     };
     let argv: Vec<String> = std::env::args().collect();
@@ -62,6 +64,7 @@ fn parse_args() -> Args {
                 a.rate_per_client_milli = (v * 1000.0).round() as u64;
                 i += 2;
             }
+            "--slow-count" => { a.slow_count = argv[i+1].parse().unwrap(); i += 2; }
             "--label" => { a.label = argv[i+1].clone(); i += 2; }
             _ => panic!("unknown arg: {}", argv[i]),
         }
@@ -99,20 +102,47 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let mut handles = Vec::with_capacity(args.clients);
+    let slow_count = args.slow_count;
     for cid in 0..args.clients as u32 {
         let addr = args.addr.clone();
         let sent = sent.clone();
         let received = received.clone();
         let hist = hist.clone();
         let rate_milli = args.rate_per_client_milli;
+        let is_slow = (cid as usize) < slow_count;
         let h = tokio::spawn(async move {
-            let stream = match TcpStream::connect(&addr).await {
-                Ok(s) => s,
-                Err(e) => { eprintln!("client {} connect failed: {}", cid, e); return; }
+            // For slow clients, shrink the recv buffer so it fills almost
+            // immediately at any test rate. Active clients use the default.
+            let stream = if is_slow {
+                let sock = match TcpSocket::new_v4() {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("client {} new_v4: {}", cid, e); return; }
+                };
+                let _ = sock.set_recv_buffer_size(4096);
+                let parsed: std::net::SocketAddr = addr.parse().unwrap();
+                match sock.connect(parsed).await {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("slow client {} connect failed: {}", cid, e); return; }
+                }
+            } else {
+                match TcpStream::connect(&addr).await {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("client {} connect failed: {}", cid, e); return; }
+                }
             };
             let _ = stream.set_nodelay(true);
             let (rd, mut wr) = stream.into_split();
             let mut rd = BufReader::new(rd);
+
+            // Slow client: connect, then sleep until end of test. Don't read, don't send.
+            // The unread server writes pile up in this client's TCP recv buffer (4KB cap),
+            // forcing the server's writer to block. That's the head-of-line setup.
+            if is_slow {
+                sleep(Duration::from_secs(total_secs + 5)).await;
+                let _ = wr.shutdown().await;
+                drop(rd);
+                return;
+            }
 
             // Reader task — measures latency on every received message.
             // Hold its handle so we can ensure it flushes before main collects stats.
