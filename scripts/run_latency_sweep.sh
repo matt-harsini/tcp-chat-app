@@ -8,9 +8,9 @@ RESULTS="$ROOT/results"
 mkdir -p "$RESULTS"
 
 NS=(10 25 50 100 200 400)
-DURATION=12
+DURATION=20
 WARMUP=3
-RATE=1   # 1 msg/sec/client; total fan-out = N * rate * N = N²
+RATE=0.1   # 0.1 msg/sec/client — well under saturation for both variants at all N
 PORT=9099
 
 CSV="$RESULTS/latency_$(date +%Y%m%d_%H%M%S).csv"

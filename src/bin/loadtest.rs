@@ -35,7 +35,7 @@ struct Args {
     clients: usize,
     duration_secs: u64,
     warmup_secs: u64,
-    rate_per_client: u64, // 0 = saturate (send as fast as possible)
+    rate_per_client_milli: u64, // 0 = saturate; otherwise rate in milli-msgs/sec (1000 = 1/sec, 100 = 0.1/sec)
     label: String,
 }
 
@@ -45,7 +45,7 @@ fn parse_args() -> Args {
         clients: 50,
         duration_secs: 15,
         warmup_secs: 3,
-        rate_per_client: 0,
+        rate_per_client_milli: 0,
         label: "run".into(),
     };
     let argv: Vec<String> = std::env::args().collect();
@@ -56,7 +56,12 @@ fn parse_args() -> Args {
             "--clients" => { a.clients = argv[i+1].parse().unwrap(); i += 2; }
             "--duration-secs" => { a.duration_secs = argv[i+1].parse().unwrap(); i += 2; }
             "--warmup-secs" => { a.warmup_secs = argv[i+1].parse().unwrap(); i += 2; }
-            "--rate-per-client" => { a.rate_per_client = argv[i+1].parse().unwrap(); i += 2; }
+            "--rate-per-client" => {
+                // accept floats like 0.1 or integers like 50
+                let v: f64 = argv[i+1].parse().unwrap();
+                a.rate_per_client_milli = (v * 1000.0).round() as u64;
+                i += 2;
+            }
             "--label" => { a.label = argv[i+1].clone(); i += 2; }
             _ => panic!("unknown arg: {}", argv[i]),
         }
@@ -75,7 +80,11 @@ async fn main() -> std::io::Result<()> {
     eprintln!(
         "[loadtest] {} clients={} duration={}s warmup={}s rate/client={}",
         args.label, args.clients, args.duration_secs, args.warmup_secs,
-        if args.rate_per_client == 0 { "saturate".to_string() } else { args.rate_per_client.to_string() }
+        if args.rate_per_client_milli == 0 {
+            "saturate".to_string()
+        } else {
+            format!("{}m/s", args.rate_per_client_milli)
+        }
     );
 
     // T0 = the moment the warmup window begins. measurement window starts at T0 + warmup.
@@ -95,7 +104,7 @@ async fn main() -> std::io::Result<()> {
         let sent = sent.clone();
         let received = received.clone();
         let hist = hist.clone();
-        let rate = args.rate_per_client;
+        let rate_milli = args.rate_per_client_milli;
         let h = tokio::spawn(async move {
             let stream = match TcpStream::connect(&addr).await {
                 Ok(s) => s,
@@ -106,9 +115,10 @@ async fn main() -> std::io::Result<()> {
             let mut rd = BufReader::new(rd);
 
             // Reader task — measures latency on every received message.
+            // Hold its handle so we can ensure it flushes before main collects stats.
             let received_r = received.clone();
             let hist_r = hist.clone();
-            tokio::spawn(async move {
+            let reader_handle = tokio::spawn(async move {
                 let mut line = String::new();
                 let mut local: Vec<u64> = Vec::with_capacity(8192);
                 loop {
@@ -131,7 +141,8 @@ async fn main() -> std::io::Result<()> {
                                 let lat = recv_us.saturating_sub(send_us);
                                 received_r.fetch_add(1, Ordering::Relaxed);
                                 local.push(lat.min(60_000_000));
-                                if local.len() >= 4096 {
+                                // Flush often so low-rate runs still produce histogram data.
+                                if local.len() >= 8 {
                                     let mut h = hist_r.lock().await;
                                     for v in local.drain(..) { let _ = h.record(v); }
                                 }
@@ -147,8 +158,9 @@ async fn main() -> std::io::Result<()> {
 
             // Sender loop.
             let mut seq: u32 = 0;
-            let mut tick = if rate > 0 {
-                let period = Duration::from_secs_f64(1.0 / rate as f64);
+            let mut tick = if rate_milli > 0 {
+                // rate_milli = milli-msgs/sec, e.g. 100 = 0.1 msg/sec; period = 1000/rate_milli sec
+                let period = Duration::from_secs_f64(1000.0 / rate_milli as f64);
                 Some(interval(period))
             } else {
                 None
@@ -166,18 +178,24 @@ async fn main() -> std::io::Result<()> {
                     sent.fetch_add(1, Ordering::Relaxed);
                 }
                 // Yield-friendly busy loop in saturate mode
-                if rate == 0 && seq % 1024 == 0 {
+                if rate_milli == 0 && seq % 1024 == 0 {
                     tokio::task::yield_now().await;
                 }
             }
             let _ = wr.shutdown().await;
+            // Wait for reader to drain (EOF arrives shortly after our shutdown)
+            // and flush its remaining samples to the global histogram.
+            let _ = reader_handle.await;
         });
         handles.push(h);
     }
 
-    // Wait for the test window to elapse (sender stops, then drain a moment).
+    // Wait for the test window to elapse, then for all client tasks to finish
+    // (which includes their reader-flush epilogues).
     sleep(Duration::from_secs(total_secs)).await;
-    sleep(Duration::from_millis(500)).await; // brief drain
+    for h in handles {
+        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+    }
 
     // Collect.
     let sent_n = sent.load(Ordering::Relaxed);
@@ -193,7 +211,7 @@ async fn main() -> std::io::Result<()> {
 
     println!(
         "{},{},{},{},{},{},{:.1},{},{},{},{},{}",
-        args.label, args.clients, args.duration_secs, args.rate_per_client,
+        args.label, args.clients, args.duration_secs, args.rate_per_client_milli,
         sent_n, recv_n, recv_per_sec,
         p50, p95, p99, p999, pmax
     );
