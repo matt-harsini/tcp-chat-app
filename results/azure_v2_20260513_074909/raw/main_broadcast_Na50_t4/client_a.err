@@ -1,0 +1,1 @@
+[loadtest] broadcast-A-Na50-t4 clients=50 duration=240s warmup=60s rate/client=5000m/s

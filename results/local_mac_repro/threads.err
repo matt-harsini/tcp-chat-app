@@ -1,0 +1,1 @@
+[loadtest] threads-n100 clients=100 duration=270s warmup=30s rate/client=saturate

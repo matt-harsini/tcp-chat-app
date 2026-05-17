@@ -1,0 +1,3 @@
+[loadtest] broadcast-A-Na10-t1 clients=10 duration=240s warmup=60s rate/client=5000m/s
+Read from remote host 20.7.28.98: Operation timed out
+client_loop: send disconnect: Broken pipe

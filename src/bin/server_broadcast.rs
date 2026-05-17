@@ -5,14 +5,28 @@
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
+    net::{TcpListener, TcpSocket},
     sync::broadcast::{self, error::RecvError},
 };
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".into());
-    let listener = TcpListener::bind(&addr).await?;
+    // Pin SO_RCVBUF and SO_SNDBUF on the listening socket. Accepted connections
+    // inherit these values, disabling kernel autotuning per-socket. Mirrors the
+    // server_mutex.rs buffer pinning so the architectural comparison is on
+    // identical kernel-buffer footing.
+    let listener: TcpListener = {
+        let sock = TcpSocket::new_v4()?;
+        sock.set_recv_buffer_size(262144)?;
+        // SND buffer pinned to 16 KiB (Phase 11): matches server_mutex /
+        // server_threads. Per-subscriber writer task parks independently;
+        // no shared lock to cascade through.
+        sock.set_send_buffer_size(16384)?;
+        let parsed: std::net::SocketAddr = addr.parse().expect("invalid bind addr");
+        sock.bind(parsed)?;
+        sock.listen(1024)?
+    };
     // Large buffer (1M) so transient receiver lag doesn't trigger RecvError::Lagged
     // — that would silently drop messages and confound the architectural comparison.
     let (tx, _) = broadcast::channel::<String>(1_000_000);

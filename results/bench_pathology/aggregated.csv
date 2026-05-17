@@ -1,0 +1,11 @@
+variant,metric,median_us,min_us,max_us
+broadcast,max_us,1244,663,10319
+broadcast,p50_us,120,114,124
+broadcast,p95_us,242,240,260
+broadcast,p99_9_us,768,438,9799
+broadcast,p99_us,332,327,402
+mutex,max_us,98047,97215,105919
+mutex,p50_us,95103,94911,95231
+mutex,p95_us,96511,96383,96831
+mutex,p99_9_us,98047,97215,105919
+mutex,p99_us,97023,96767,98239

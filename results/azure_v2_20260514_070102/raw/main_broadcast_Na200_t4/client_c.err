@@ -1,0 +1,1 @@
+[loadtest] broadcast-C-Nc200-t4 clients=200 duration=120s warmup=30s rate/client=5000m/s

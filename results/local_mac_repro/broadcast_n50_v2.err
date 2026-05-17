@@ -1,0 +1,1 @@
+[loadtest] broadcast-n50-v2 clients=50 duration=270s warmup=30s rate/client=saturate

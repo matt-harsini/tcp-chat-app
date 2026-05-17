@@ -1,0 +1,11 @@
+[loadtest] mutex-B-Nb10-t1 clients=10 duration=240s warmup=60s rate/client=5000m/s
+client 2 connect failed: Connection timed out (os error 110)
+client 4 connect failed: Connection timed out (os error 110)
+client 5 connect failed: Connection timed out (os error 110)
+client 3 connect failed: Connection timed out (os error 110)
+client 9 connect failed: Connection timed out (os error 110)
+client 1 connect failed: Connection timed out (os error 110)
+client 8 connect failed: Connection timed out (os error 110)
+client 7 connect failed: Connection timed out (os error 110)
+client 0 connect failed: Connection timed out (os error 110)
+client 6 connect failed: Connection timed out (os error 110)

@@ -1,0 +1,1 @@
+[loadtest] mutex-B-Nb10-t2 clients=10 duration=240s warmup=60s rate/client=5000m/s

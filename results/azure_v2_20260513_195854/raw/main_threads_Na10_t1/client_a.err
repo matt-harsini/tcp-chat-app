@@ -1,0 +1,1 @@
+[loadtest] threads-A-Na10-t1 clients=10 duration=120s warmup=30s rate/client=5000m/s

@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpSocket, TcpStream},
+    net::TcpSocket,
     sync::Mutex,
     time::{interval, sleep},
 };
@@ -97,8 +97,10 @@ async fn main() -> std::io::Result<()> {
 
     let sent = Arc::new(AtomicU64::new(0));
     let received = Arc::new(AtomicU64::new(0));
+    // Bounds: 1 µs to 300 s. Earlier 60s ceiling clipped real mutex-collapse tails
+    // (slide 17's "≥60 s" reading was the clip, not the truth).
     let hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
-        Histogram::new_with_bounds(1, 60_000_000, 3).unwrap()
+        Histogram::new_with_bounds(1, 3_600_000_000, 3).unwrap()
     ));
 
     let mut handles = Vec::with_capacity(args.clients);
@@ -125,7 +127,17 @@ async fn main() -> std::io::Result<()> {
                     Err(e) => { eprintln!("slow client {} connect failed: {}", cid, e); return; }
                 }
             } else {
-                match TcpStream::connect(&addr).await {
+                // Active clients: pin SO_RCVBUF and SO_SNDBUF to remove kernel
+                // autotuning as a confounding variable. 256 KiB is large enough
+                // that fast clients never see backpressure under normal rates.
+                let sock = match TcpSocket::new_v4() {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("client {} new_v4: {}", cid, e); return; }
+                };
+                let _ = sock.set_recv_buffer_size(262144);
+                let _ = sock.set_send_buffer_size(262144);
+                let parsed: std::net::SocketAddr = addr.parse().unwrap();
+                match sock.connect(parsed).await {
                     Ok(s) => s,
                     Err(e) => { eprintln!("client {} connect failed: {}", cid, e); return; }
                 }
@@ -134,13 +146,38 @@ async fn main() -> std::io::Result<()> {
             let (rd, mut wr) = stream.into_split();
             let mut rd = BufReader::new(rd);
 
-            // Slow client: connect, then sleep until end of test. Don't read, don't send.
-            // The unread server writes pile up in this client's TCP recv buffer (4KB cap),
-            // forcing the server's writer to block. That's the head-of-line setup.
+            // Slow client (Option B, slow-read variant):
+            //
+            // Bypass BufReader entirely and drain the kernel RCV buffer at a
+            // throttled rate using raw async read(). Hardcoded slow-rate: ~10
+            // reads/sec. Each read pulls up to 128 bytes (~2 msgs) from kernel.
+            //
+            // Effect: client's kernel RCV buffer fills (small SO_RCVBUF=4 KiB),
+            // rwnd → 0 advertised to server, server's per-socket SND fills,
+            // server's write_all parks. Under server_mutex / server_threads
+            // that park happens while the lock is held → cascading delay for
+            // all other broadcasts queued on the lock. Under server_broadcast
+            // each subscriber parks independently — no shared lock to gate.
+            //
+            // BufReader was a footgun: it prefetches up to 8 KiB per syscall,
+            // which drains the kernel RCV in one shot regardless of how slowly
+            // the application then consumes lines. Real backpressure requires
+            // throttling the read() syscall itself, not the line consumption.
             if is_slow {
-                sleep(Duration::from_secs(total_secs + 5)).await;
+                use tokio::io::AsyncReadExt;
+                let mut raw_rd = rd.into_inner();
+                let slow_period = Duration::from_millis(100); // ~10 reads/sec
+                let mut buf = [0u8; 128];
+                // Bug fix: check stop_at on every iteration so the slow client
+                // doesn't infinite-loop past the measurement window and stall
+                // the loadtest main thread's handle-join phase.
+                while Instant::now() < stop_at {
+                    match raw_rd.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => { sleep(slow_period).await; }
+                    }
+                }
                 let _ = wr.shutdown().await;
-                drop(rd);
                 return;
             }
 
@@ -170,7 +207,7 @@ async fn main() -> std::io::Result<()> {
                             if Instant::now() >= measure_start {
                                 let lat = recv_us.saturating_sub(send_us);
                                 received_r.fetch_add(1, Ordering::Relaxed);
-                                local.push(lat.min(60_000_000));
+                                local.push(lat.min(3_600_000_000));
                                 // Flush often so low-rate runs still produce histogram data.
                                 if local.len() >= 8 {
                                     let mut h = hist_r.lock().await;
@@ -224,7 +261,9 @@ async fn main() -> std::io::Result<()> {
     // (which includes their reader-flush epilogues).
     sleep(Duration::from_secs(total_secs)).await;
     for h in handles {
-        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+        // Reader epilogue can take many seconds to drain under mutex-collapse.
+        // Killing it early would drop exactly the tail samples we want to record.
+        let _ = tokio::time::timeout(Duration::from_secs(60), h).await;
     }
 
     // Collect.
